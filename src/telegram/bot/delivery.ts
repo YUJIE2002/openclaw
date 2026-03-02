@@ -320,7 +320,11 @@ export async function resolveMedia(
   stickerMetadata?: StickerMetadata;
 } | null> {
   const msg = ctx.message;
-  const downloadAndSaveTelegramFile = async (filePath: string, fetchImpl: typeof fetch) => {
+  const downloadAndSaveTelegramFile = async (
+    filePath: string,
+    fetchImpl: typeof fetch,
+    senderFileName?: string,
+  ) => {
     const url = `https://api.telegram.org/file/bot${token}/${filePath}`;
     const fetched = await fetchRemoteMedia({
       url,
@@ -329,7 +333,9 @@ export async function resolveMedia(
       maxBytes,
       ssrfPolicy: TELEGRAM_MEDIA_SSRF_POLICY,
     });
-    const originalName = fetched.fileName ?? filePath;
+    // Prefer the original filename from the sender (msg.document.file_name etc.)
+    // over the server-side file path which uses Telegram's internal naming scheme.
+    const originalName = senderFileName ?? fetched.fileName ?? filePath;
     return saveMediaBuffer(fetched.buffer, fetched.contentType, "inbound", maxBytes, originalName);
   };
 
@@ -451,7 +457,16 @@ export async function resolveMedia(
   if (!fetchImpl) {
     throw new Error("fetch is not available; set channels.telegram.proxy in config");
   }
-  const saved = await downloadAndSaveTelegramFile(file.file_path, fetchImpl);
+  // Telegram Bot API provides the original filename on document, audio, video,
+  // and animation objects.  ctx.getFile() only returns a server-side path like
+  // "documents/file_42---UUID.pdf" — the sender's filename is lost if we don't
+  // read it from the message object explicitly.
+  const senderFileName =
+    msg.document?.file_name ??
+    msg.audio?.file_name ??
+    msg.video?.file_name ??
+    msg.animation?.file_name;
+  const saved = await downloadAndSaveTelegramFile(file.file_path, fetchImpl, senderFileName);
   const placeholder = resolveTelegramMediaPlaceholder(msg) ?? "<media:document>";
   return { path: saved.path, contentType: saved.contentType, placeholder };
 }
