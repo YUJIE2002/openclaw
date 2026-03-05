@@ -1073,7 +1073,10 @@ export const chatHandlers: GatewayRequestHandlers = {
       ),
     };
     context.broadcast("chat", chatPayload);
-    context.nodeSendToSession(sessionKey, "chat", chatPayload);
+    // Use the raw key for node fanout — node subscriptions are stored by
+    // the exact key text the node used when subscribing, not the canonical
+    // form.  sendToSession does an exact map lookup.
+    context.nodeSendToSession(rawSessionKey, "chat", chatPayload);
 
     respond(true, { ok: true, messageId: appended.messageId });
   },

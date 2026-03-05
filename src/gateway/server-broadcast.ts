@@ -1,5 +1,7 @@
+import { loadConfig } from "../config/config.js";
 import { MAX_BUFFERED_BYTES } from "./server-constants.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
+import { resolveSessionStoreKey } from "./session-utils.js";
 import { logWs, shouldLogWs, summarizeAgentEventForWsLog } from "./ws-log.js";
 
 const ADMIN_SCOPE = "operator.admin";
@@ -74,7 +76,11 @@ function hasEventScope(client: GatewayWsClient, event: string): boolean {
  *  3. Clients with a non-empty chatSessionKeys set → only receive events
  *     whose sessionKey is in that set.
  */
-function shouldReceiveChatEvent(client: GatewayWsClient, sessionKey: string | undefined): boolean {
+function shouldReceiveChatEvent(
+  client: GatewayWsClient,
+  sessionKey: string | undefined,
+  canonicalKey: string | undefined,
+): boolean {
   // Admin-scoped clients (e.g., Control UI operators) always see everything.
   if (hasAdminScope(client)) {
     return true;
@@ -90,7 +96,16 @@ function shouldReceiveChatEvent(client: GatewayWsClient, sessionKey: string | un
   if (!sessionKey) {
     return true;
   }
-  return tracked.has(sessionKey);
+  // Try raw key first (fast path), then fall back to canonical form.
+  // Event producers may emit raw aliases (e.g. "main") while tracked keys
+  // are canonical (e.g. "agent:main:main"), so we check both.
+  if (tracked.has(sessionKey)) {
+    return true;
+  }
+  if (canonicalKey && canonicalKey !== sessionKey) {
+    return tracked.has(canonicalKey);
+  }
+  return false;
 }
 
 export function createGatewayBroadcaster(params: { clients: Set<GatewayWsClient> }) {
@@ -130,10 +145,26 @@ export function createGatewayBroadcaster(params: { clients: Set<GatewayWsClient>
       logWs("out", "event", logMeta);
     }
     // Extract sessionKey from chat event payloads for session-scoped delivery.
-    const chatSessionKey =
-      event === "chat" && payload && typeof payload === "object" && "sessionKey" in payload
-        ? (payload as { sessionKey?: string }).sessionKey
-        : undefined;
+    // Resolve the canonical form once so we don't call resolveSessionStoreKey
+    // per-client inside the loop.
+    let chatSessionKey: string | undefined;
+    let chatCanonicalKey: string | undefined;
+    if (event === "chat" && payload && typeof payload === "object" && "sessionKey" in payload) {
+      chatSessionKey = (payload as { sessionKey?: string }).sessionKey;
+      if (chatSessionKey) {
+        try {
+          const resolved = resolveSessionStoreKey({
+            cfg: loadConfig(),
+            sessionKey: chatSessionKey,
+          });
+          if (resolved !== chatSessionKey) {
+            chatCanonicalKey = resolved;
+          }
+        } catch {
+          /* config not available — skip canonicalization */
+        }
+      }
+    }
 
     for (const c of params.clients) {
       if (targetConnIds && !targetConnIds.has(c.connId)) {
@@ -144,7 +175,7 @@ export function createGatewayBroadcaster(params: { clients: Set<GatewayWsClient>
       }
       // Session-scoped delivery for chat events: skip clients that have
       // declared session interest and are not subscribed to this session.
-      if (event === "chat" && !shouldReceiveChatEvent(c, chatSessionKey)) {
+      if (event === "chat" && !shouldReceiveChatEvent(c, chatSessionKey, chatCanonicalKey)) {
         continue;
       }
       const slow = c.socket.bufferedAmount > MAX_BUFFERED_BYTES;

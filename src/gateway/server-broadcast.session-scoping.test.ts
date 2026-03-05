@@ -2,6 +2,20 @@ import { describe, it, expect, vi } from "vitest";
 import { createGatewayBroadcaster } from "./server-broadcast.js";
 import type { GatewayWsClient } from "./server/ws-types.js";
 
+// Mock session-utils so we can control canonical key resolution in tests.
+vi.mock("./session-utils.js", () => ({
+  resolveSessionStoreKey: vi.fn(({ sessionKey }: { sessionKey: string }) => {
+    // Simulate canonical resolution: "main" → "agent:main:main"
+    const aliases: Record<string, string> = {
+      main: "agent:main:main",
+    };
+    return aliases[sessionKey] ?? sessionKey;
+  }),
+}));
+vi.mock("../config/config.js", () => ({
+  loadConfig: vi.fn(() => ({})),
+}));
+
 function createMockClient(overrides: {
   connId: string;
   scopes?: string[];
@@ -151,6 +165,36 @@ describe("chat broadcast session scoping", () => {
 
     // Cannot scope without sessionKey → deliver to all
     expect(getSentPayloads(scopedClient)).toHaveLength(1);
+  });
+
+  it("matches chat events via canonical key when raw alias differs", () => {
+    // Client tracked the canonical key "agent:main:main" via chat.send
+    const client = createMockClient({
+      connId: "a",
+      chatSessionKeys: new Set(["agent:main:main"]),
+    });
+    const clients = new Set([client]);
+    const { broadcast } = createGatewayBroadcaster({ clients });
+
+    // Event producer emits raw alias "main" — resolveSessionStoreKey maps
+    // it to "agent:main:main", so the client should still receive the event.
+    broadcast("chat", { sessionKey: "main", text: "via alias" });
+
+    expect(getSentPayloads(client)).toHaveLength(1);
+  });
+
+  it("does NOT deliver when neither raw nor canonical key matches", () => {
+    const client = createMockClient({
+      connId: "a",
+      chatSessionKeys: new Set(["agent:main:main"]),
+    });
+    const clients = new Set([client]);
+    const { broadcast } = createGatewayBroadcaster({ clients });
+
+    // "other-session" is not an alias for "agent:main:main"
+    broadcast("chat", { sessionKey: "other-session", text: "nope" });
+
+    expect(getSentPayloads(client)).toHaveLength(0);
   });
 
   it("client tracking multiple sessions receives events from all of them", () => {
